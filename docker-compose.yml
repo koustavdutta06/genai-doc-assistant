@@ -1,0 +1,30 @@
+services:
+  backend:
+    build: .
+    image: genai-doc-assistant:latest
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health-check')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    image: genai-doc-assistant:latest
+    command: python -m streamlit run streamlit_app/app.py --server.address 0.0.0.0 --server.port 8501 --server.baseUrlPath doc-assistant
+    ports:
+      - "8501:8501"
+    environment:
+      - BACKEND_URL=http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
