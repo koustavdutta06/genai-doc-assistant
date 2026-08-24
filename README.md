@@ -2,6 +2,8 @@
 
 A Generative AI + RAG + Agentic AI capstone project. Upload enterprise documents (PDF, TXT, CSV, XLSX), ask natural-language questions, and get grounded answers with citations, produced by a LangGraph agent pipeline running entirely on local models via Ollama.
 
+> For the full technical write-up (detailed architecture, component breakdown, design-decision log, reliability mechanisms), see [`docs/PROJECT_DOCUMENTATION.md`](docs/PROJECT_DOCUMENTATION.md).
+
 ## Architecture
 
 ```
