@@ -59,11 +59,11 @@ flowchart TD
 | REST API | FastAPI + Uvicorn | Async, typed, auto-generated Swagger docs |
 | Web UI | Streamlit | Fast to build a chat + upload interface without a separate frontend stack |
 | Agent orchestration | LangGraph (`StateGraph`) | Explicit, inspectable state machine rather than an opaque agent loop — each step (plan/retrieve/reason/validate) is a visible node with typed state |
-| LLM (chat/reasoning) | Ollama, `llama3.2:3b` | Runs fully locally, no API cost/key. Sized to fit this machine's 4GB-VRAM GPU (see §9, Design Decisions) |
+| LLM (chat/reasoning) | Ollama, `llama3.2:3b` | Runs fully locally, no API cost/key. Sized to fit this machine's 4GB-VRAM GPU (see §11, Design Decisions) |
 | Embeddings | Ollama, `nomic-embed-text` | Local embedding model, 768-dim, small footprint |
 | Vector store | ChromaDB (`PersistentClient`) | Local, persistent, simple metadata filtering |
 | Document parsing | `langchain_community.PyPDFLoader` (PDF), `pandas` (CSV/XLSX), stdlib (TXT) | Standard, well-supported loaders per format |
-| Structured data queries | `pandas.DataFrame.query()` | Exact, deterministic filtering/aggregation over tabular data — see §6 |
+| Structured data queries | `pandas.DataFrame.query()` | Exact, deterministic filtering/aggregation over tabular data — see §7 |
 | Config | `pydantic-settings` | Typed, env-driven configuration (`.env`) |
 | Testing | `pytest` | Unit coverage for pure-function logic (chunking) |
 | Deployment | Docker + Docker Compose | Reproducible container deployment for the app tier |
@@ -95,7 +95,29 @@ app/
 streamlit_app/app.py          Chat + upload UI, calls the FastAPI backend over HTTP
 ```
 
-## 5. The Agentic Workflow (LangGraph)
+## 5. System Setup
+
+**Prerequisites:** Python 3.12+, [Ollama](https://ollama.com). Docker + Docker Compose optional (for containerized deployment, §10).
+
+1. Install Ollama and pull the two local models used by this project:
+   ```
+   ollama pull llama3.2:3b
+   ollama pull nomic-embed-text
+   ```
+   Ensure Ollama is running (tray app, or `ollama serve`) before starting the backend.
+2. Create a virtualenv and install dependencies:
+   ```
+   python -m venv venv
+   venv\Scripts\pip install -r requirement.txt
+   ```
+3. Copy `.env.example` to `.env` (defaults already match local Ollama; edit only if you changed model names/ports).
+4. Run the backend: `venv\Scripts\python -m uvicorn app.main:app --reload`
+5. In a second terminal, run the UI: `venv\Scripts\python -m streamlit run streamlit_app/app.py --server.baseUrlPath doc-assistant`
+6. Open http://localhost:8501/doc-assistant — upload a document, ask a question. Sanity check anytime at http://localhost:8000/health-check.
+
+(Full walkthrough, troubleshooting, and the Docker path are in `README.md` and §10 below.)
+
+## 6. Agent Roles & The Agentic Workflow (LangGraph)
 
 The orchestrator (`app/agents/orchestrator.py`) defines a typed `AgentState` (a `TypedDict`) that flows through the graph, accumulating fields as each node runs. It is compiled once (`@lru_cache`) and re-invoked per question.
 
@@ -123,22 +145,22 @@ reason -> validate -> (ungrounded & retries left: back to reason)
 
 `run_agent(question, top_k)` is the single function the API layer calls; it invokes the graph and maps the final state into the `AskQuestionResponse` returned to the client.
 
-## 6. Why Two Retrieval Tools?
+## 7. Why Two Retrieval Tools?
 
 Semantic vector search retrieves by *meaning*, not by evaluating conditions. A question like *"employees whose salary is more than 100000"* has no reliable relationship to embedding distance — the retriever will confidently return some rows that don't satisfy the condition and miss others that do, because "closeness in embedding space" isn't the same as "satisfies a numeric filter." This was discovered directly during testing: with only semantic search, the same salary question returned an incomplete and partially wrong list.
 
 The fix is architectural, not a prompt tweak: the agent has a second tool, `tabular_query`, that runs the filter/aggregate directly against the real data with pandas — guaranteeing correctness for that class of question — while semantic search continues to handle narrative/unstructured document text. The planner decides which tool to use per question.
 
-## 7. Reliability & Guardrails
+## 8. Reliability & Guardrails
 
 - **Input safety** (`safety_check` node): rejects empty/oversized questions, common prompt-injection phrasings, and a basic unsafe-content keyword list before any retrieval happens.
 - **Groundedness check** (`validate` node): after the LLM answers, the answer's sentences are checked for lexical word-overlap against the retrieved context; an explicit "I don't have enough information" abstention is always treated as valid (not a failure) rather than penalized.
 - **Bounded retry**: if the answer is judged ungrounded, the reasoner is re-invoked once with stricter instructions before the system falls back to an explicit abstention — it never silently returns an unverified answer after exhausting retries.
 - **Deterministic aggregate correction**: small local LLMs occasionally recompute a count/sum/average instead of citing the exact value the tabular tool already calculated, and get the arithmetic wrong. Rather than trusting the model, the validator checks whether the exact computed value is present in the answer text and overwrites the answer with a correct, deterministically-generated statement if not.
 - **Structured-query sandboxing**: query expressions are restricted to pandas' `DataFrame.query()` boolean-expression grammar (not arbitrary Python), and a regex blocklist rejects tokens like `__`, `import`, `exec(`, `os.`, `subprocess` as defense-in-depth before any expression is evaluated.
-- **Temperature = 0**: the chat model runs at zero sampling temperature — for a fact-lookup assistant that must cite sources, deterministic output is strictly preferable to creative variation, and it measurably improved answer consistency during testing (see §9).
+- **Temperature = 0**: the chat model runs at zero sampling temperature — for a fact-lookup assistant that must cite sources, deterministic output is strictly preferable to creative variation, and it measurably improved answer consistency during testing (see §11).
 
-## 8. API Reference
+## 9. API Reference
 
 | Endpoint | Method | Description |
 |---|---|---|
@@ -148,24 +170,32 @@ The fix is architectural, not a prompt tweak: the agent has a second tool, `tabu
 
 Interactive Swagger docs are available at `/docs` once the backend is running.
 
-## 9. Design Decisions Log
+## 10. Deployment Steps
 
-Key pivots made during development, and why:
+**Local (native)** — see §5 System Setup above for the full sequence.
+
+**Docker** (backend + UI containerized; Ollama stays native on the host — GPU passthrough into Docker on Windows would need WSL2 + the NVIDIA Container Toolkit, unnecessary when Ollama already has native GPU support):
+
+1. Install Ollama and pull the models on the host (§5, step 1); make sure it's running.
+2. From the project root: `docker compose up --build`
+3. Open http://localhost:8501/doc-assistant. Backend at http://localhost:8000 (`/docs` for Swagger).
+4. Stop with `docker compose down` — `data/` is bind-mounted, so uploads and the Chroma DB persist across restarts.
+
+The backend reaches host-side Ollama via `http://host.docker.internal:11434`, confirmed working during testing. If it can't connect, Ollama may be bound to `127.0.0.1` only — set `OLLAMA_HOST=0.0.0.0` in the Ollama environment and restart it. The frontend container reaches the backend container via the Compose network (`http://backend:8000`), not `localhost`.
+
+## 11. Design Decisions & Challenges Faced During Development
+
+Real pivots made during development — each one was a working assumption that testing proved wrong, not a design choice made in the abstract:
 
 - **LLM provider — Anthropic API considered, then Ollama chosen.** The user has a Claude subscription but not separate Anthropic API billing; Ollama (local, free) was used instead, with `langchain-ollama` for both chat and embeddings.
-- **Chat model — `llama3.1:8b` planned, `llama3.2:3b` used.** The original plan picked `llama3.1:8b` partly for reliable native tool-calling. In practice this machine's GPU (GTX 1650, 4GB VRAM) OOM'd loading an 8B model. Since the implementation invokes tools manually (not via the LLM's own function-calling), model size mattered more than tool-calling support — `llama3.2:3b` (~2GB) was substituted and fits comfortably.
+- **Challenge: GPU out-of-memory.** The original plan picked `llama3.1:8b` partly for reliable native tool-calling. Loading it crashed with a CUDA OOM error — this machine's GPU (GTX 1650) only has 4GB VRAM. Since the implementation invokes tools manually (not via the LLM's own function-calling), model size mattered more than tool-calling support — swapped to `llama3.2:3b` (~2GB), which fits comfortably.
 - **Agent framework — LangChain + LangGraph**, chosen over hand-rolled orchestration for an explicit, inspectable state graph that maps cleanly onto separate planner/retriever/reasoner/validator files.
-- **Temperature 0.1 → 0.0.** Initial testing showed the small model's structured-output routing decisions and short-list answers were inconsistent run-to-run at temperature 0.1 (e.g., sometimes dropping a correct row from a 4-item list). Setting temperature to 0 made both routing and answer generation fully deterministic across repeated runs with identical input.
-- **Single-tool RAG → dual-tool agent.** Manual testing surfaced that plain semantic search gives wrong answers to filter/aggregate questions over tabular data (see §6) — this drove adding the `tabular_query` tool and the planner's routing logic, including a deterministic layer to compensate for the small model's unreliable structured-output generation (flaky query expressions, occasional SQL syntax instead of pandas, mis-set routing flags).
-- **Deterministic aggregate correction.** Even with the tabular tool computing an exact value, the LLM sometimes ignored it and recomputed incorrectly. Rather than relying further on prompting, the validator now checks and corrects this class of error directly.
+- **Challenge: small-model non-determinism.** At temperature 0.1, the model's structured-output routing decisions and short-list answers were inconsistent run-to-run — e.g. sometimes dropping a correct row from a 4-item list, or leaving a query expression empty. Setting temperature to 0 made both routing and answer generation fully deterministic across repeated runs with identical input.
+- **Challenge: semantic search gives wrong answers on tabular filter/aggregate questions.** Discovered via direct user testing: asking "employees whose salary is more than 100000" against an uploaded CSV returned an incomplete, partially wrong list, because vector similarity has no relationship to numeric conditions — it retrieves by meaning, not by evaluating a filter. Fixed architecturally by adding a second agent tool, `tabular_query`, that runs the filter/aggregate directly against the real data with pandas (see §7), plus a planner that routes each question to the right tool.
+- **Challenge: the small model's own structured-output for the tabular tool was unreliable** — it sometimes left the query expression empty, wrote pseudo-SQL instead of pandas syntax, or mis-set the routing flag for questions unrelated to the table (e.g. a bare "how many" in a narrative question about a policy document wrongly triggered the CSV tool). Fixed with a deterministic layer: regex-based comparison/aggregate-keyword detection plus a lookup against the table's actual categorical values, used to override or backstop the LLM's own fields rather than trusting them outright.
+- **Challenge: the model ignored an exact computed number and recomputed it wrong.** Even when the tabular tool calculated an exact aggregate (e.g. an average) and the prompt explicitly said "use this value, don't recompute it," the model sometimes did the arithmetic itself anyway — and got it wrong. Fixed by having the validator check whether the exact computed value is present in the final answer and deterministically override it if not, rather than relying further on prompting.
 
-## 10. Deployment
-
-**Local (native):** see `README.md` → Setup. Requires Ollama running natively with the two models pulled, a Python virtualenv, and `.env` copied from `.env.example`.
-
-**Docker:** see `README.md` → Docker deployment. The FastAPI backend and Streamlit UI run as containers (`docker-compose.yml`); Ollama stays native on the host (GPU passthrough into Docker on Windows would require WSL2 + the NVIDIA Container Toolkit, unnecessary when Ollama already has native GPU support). The backend reaches host Ollama via `http://host.docker.internal:11434`; `data/` is bind-mounted so uploads and the vector DB persist across container restarts.
-
-## 11. Testing
+## 12. Testing
 
 Automated: `pytest tests/` covers `chunking_service` (pure function, no Ollama dependency).
 
@@ -177,7 +207,7 @@ Manual end-to-end verification performed during development:
 - Structured aggregate questions (count / average) — verified against hand-computed expected results
 - Full pipeline re-verified against the containerized (Docker) deployment, confirming identical results to the native run
 
-## 12. Known Limitations
+## 13. Known Limitations
 
 - Guardrails use lexical-overlap heuristics and a keyword/regex blocklist, not a dedicated safety model — adequate for a capstone demo, not production-hardened.
 - Single ChromaDB collection shared across all uploaded documents; no per-user or per-session isolation.
